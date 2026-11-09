@@ -1,0 +1,1 @@
+Webcam air-drawing app using Python, OpenCV and MediaPipe, with gesture controls, stroke smoothing, PNG/SVG export and optional Meshy image-to-3D generation.

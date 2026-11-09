@@ -1,0 +1,5 @@
+mediapipe==1.2.2
+opencv-contrib-python==5.0.0.93
+numpy==2.5.4
+requests==2.34.2
+python-dotenv==1.2.2

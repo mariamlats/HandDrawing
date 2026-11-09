@@ -3,25 +3,29 @@ import time
 import math
 import base64
 import threading
-import webbrowser
 import subprocess
+import sys
+import uuid
+from pathlib import Path
+from hand_tracker import HandTracker
+from meshy_client import MeshyClient, MeshyError, download_glb
 from typing import List, Tuple, Optional
 
 import cv2
 import numpy as np
-import mediapipe as mp
-import requests
 from dotenv import load_dotenv
 
 # =========================
 # SETTINGS / CONSTANTS
 # =========================
 WINDOW_NAME = "Hand Drawing"
-OUTPUT_DIR = "outputs"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = str(BASE_DIR / "outputs")
 
-load_dotenv()
-MESHY_API_KEY = os.getenv("MESHY_API_KEY", "")  # expects .env next to the script (or project root)
+load_dotenv(BASE_DIR / ".env")
+MESHY_API_KEY = os.getenv("MESHY_API_KEY", "")
+MESHY_ENABLED = os.getenv("MESHY_ENABLED", "false").lower() == "true"
+MESHY_AUTO_OPEN = os.getenv("MESHY_AUTO_OPEN", "false").lower() == "true"
 
 # Drawing state
 draw_color = (0, 255, 0)      # BGR (OpenCV uses BGR, not RGB)
@@ -76,7 +80,9 @@ class Button:
             (tw, thh), _ = cv2.getTextSize(self.text, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
             tx = self.x + (self.w - tw) // 2
             ty = self.y + (self.h + thh) // 2
-            cv2.putText(frame, self.text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 255, 255), 1, cv2.LINE_AA)
+            luminance = .114 * self.color[0] + .587 * self.color[1] + .299 * self.color[2]
+            text_color = (20, 20, 20) if luminance > 140 else (255, 255, 255)
+            cv2.putText(frame, self.text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, fs, text_color, 1, cv2.LINE_AA)
 
     def is_clicked(self, x, y):
         # simple bbox hit-test
@@ -131,9 +137,20 @@ meshy_job = {
 # =========================
 # MEDIAPIPE HANDS
 # =========================
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
+MODEL_PATH = BASE_DIR / "models" / "hand_landmarker.task"
+HAND_CONNECTIONS = ((0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6),
+                    (6, 7), (7, 8), (5, 9), (9, 10), (10, 11), (11, 12),
+                    (9, 13), (13, 14), (14, 15), (15, 16), (13, 17),
+                    (0, 17), (17, 18), (18, 19), (19, 20))
+
+
+def draw_tracked_hand(frame, hand_landmarks):
+    for start, end in HAND_CONNECTIONS:
+        cv2.line(frame, _lm_px(hand_landmarks, start, frame.shape),
+                 _lm_px(hand_landmarks, end, frame.shape), (100, 200, 255), 2, cv2.LINE_AA)
+    for index in range(21):
+        cv2.circle(frame, _lm_px(hand_landmarks, index, frame.shape), 3,
+                   (255, 255, 255), -1, cv2.LINE_AA)
 
 def _lm_px(hand_landmarks, idx: int, frame_shape) -> Tuple[int, int]:
     # convert normalized landmark coords -> pixel coords
@@ -209,10 +226,7 @@ def check_ui_interaction(x: int, y: int, clicked_event: bool, current_canvas_bgr
 
     # clear everything
     if clear_button.is_clicked(x, y):
-        strokes.clear()
-        selected_stroke_idx = None
-        if eraser_mask is not None:
-            eraser_mask[:] = 0
+        clear_canvas()
         return "clear"
 
     # 3D export
@@ -297,22 +311,21 @@ def _rdp(points: List[Tuple[int, int]], eps: float) -> List[Tuple[int, int]]:
         projy = ay + t * vy
         return math.hypot(px - projx, py - projy)
 
-    a = points[0]
-    b = points[-1]
-    max_d = -1.0
-    idx = 0
-    for i in range(1, len(points) - 1):
-        d = perp_dist(points[i], a, b)
-        if d > max_d:
-            max_d = d
-            idx = i
-
-    if max_d > eps:
-        left = _rdp(points[: idx + 1], eps)
-        right = _rdp(points[idx:], eps)
-        return left[:-1] + right
-    else:
-        return [points[0], points[-1]]
+    if not math.isfinite(eps) or eps < 0:
+        raise ValueError("Simplification tolerance must be finite and non-negative.")
+    # Iterative RDP avoids recursion-depth failures on long, jagged strokes.
+    keep = {0, len(points) - 1}
+    pending = [(0, len(points) - 1)]
+    while pending:
+        first, last = pending.pop()
+        if last - first < 2:
+            continue
+        index = max(range(first + 1, last),
+                    key=lambda i: perp_dist(points[i], points[first], points[last]))
+        if perp_dist(points[index], points[first], points[last]) > eps:
+            keep.add(index)
+            pending.extend(((first, index), (index, last)))
+    return [points[index] for index in sorted(keep)]
 
 def _moving_average(points: List[Tuple[int, int]], k: int = 5) -> List[Tuple[int, int]]:
     # quick smoothing to reduce hand jitter (cheap + good enough)
@@ -573,16 +586,19 @@ def draw_eraser_indicator(frame: np.ndarray, center: Tuple[int, int], radius: in
 # SAVE + VECTORIZATION
 # =========================
 def _timestamp_name(prefix: str, ext: str) -> str:
-    # quick unique-ish filename; fine for a demo app
-    return os.path.join(OUTPUT_DIR, f"{prefix}_{int(time.time())}.{ext}")
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    return os.path.join(OUTPUT_DIR, f"{prefix}_{time.time_ns()}_{uuid.uuid4().hex[:8]}.{ext}")
 
 def save_png(canvas_bgr: np.ndarray) -> str:
     fname = _timestamp_name("drawing", "png")
-    cv2.imwrite(fname, canvas_bgr)
+    if not cv2.imwrite(fname, canvas_bgr):
+        raise OSError("Could not save drawing PNG.")
     return fname
 
 def _kmeans_quantize(img_bgr: np.ndarray, max_colors: int = 8) -> Tuple[np.ndarray, List[Tuple[int, int, int]]]:
-    # reduce to a small color palette so SVG export isn't insane
+    if max_colors < 1:
+        raise ValueError("max_colors must be positive.")
+    # Reduce to a bounded palette without requesting more clusters than pixels.
     img = img_bgr.copy()
     bg = np.all(img < 15, axis=2)
     pts = img[~bg].reshape(-1, 3)
@@ -591,7 +607,11 @@ def _kmeans_quantize(img_bgr: np.ndarray, max_colors: int = 8) -> Tuple[np.ndarr
 
     # heuristic for choosing K based on how many colored pixels exist
     K = int(min(max_colors, max(2, int(np.sqrt(pts.shape[0] / 2000.0) + 2))))
-    K = max(2, min(K, max_colors))
+    K = max(1, min(K, max_colors, pts.shape[0]))
+    if K == 1:
+        center = np.mean(pts, axis=0).astype(np.uint8)
+        img[~bg] = center
+        return img, [tuple(map(int, center))]
 
     Z = np.float32(pts)
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 25, 1.0)
@@ -721,114 +741,84 @@ def _file_to_data_uri_png(path: str) -> str:
     return f"data:image/png;base64,{b64}"
 
 def _download_file(url: str, out_path: str):
-    # simple download helper; enough for model files
-    r = requests.get(url, timeout=60)
-    r.raise_for_status()
-    with open(out_path, "wb") as f:
-        f.write(r.content)
+    return download_glb(url, out_path, OUTPUT_DIR)
 
-def _open_file_or_url(path: str, fallback_url: str = ""):
-    # best-effort: open file locally (mac uses "open"), otherwise open URL
-    try:
-        if os.path.exists(path):
-            subprocess.run(["open", path], check=False)
-            return
-    except Exception:
-        pass
-    if fallback_url:
-        webbrowser.open(fallback_url)
+
+def _open_file_or_url(path: str):
+    if not MESHY_AUTO_OPEN:
+        return
+    model = Path(path).resolve()
+    if model.parent != Path(OUTPUT_DIR).resolve() or model.suffix.lower() != ".glb" or not model.is_file():
+        raise MeshyError("Only a downloaded local GLB can be opened.")
+    if sys.platform == 'darwin':
+        subprocess.run(["open", str(model)], check=False)
+    elif sys.platform == 'win32':
+        os.startfile(str(model))
+    else:
+        subprocess.run(["xdg-open", str(model)], check=False)
+
 
 def _meshy_worker(png_path: str):
-    global meshy_job
     try:
-        if not MESHY_API_KEY:
-            raise RuntimeError("MESHY_API_KEY is missing in .env")
-
-        # update UI state before network calls
+        client = MeshyClient(MESHY_API_KEY)
+        task_id = client.create_task(_file_to_data_uri_png(png_path))
         with meshy_lock:
-            meshy_job.update({
-                "running": True, "task_id": None, "progress": 0, "status": "STARTING",
-                "error": "", "glb_url": "", "thumb_url": "", "glb_path": ""
-            })
+            meshy_job.update(task_id=task_id, status="PENDING", progress=0)
 
-        data_uri = _file_to_data_uri_png(png_path)
-
-        url = "https://api.meshy.ai/openapi/v1/image-to-3d"
-        headers = {"Authorization": f"Bearer {MESHY_API_KEY}", "Content-Type": "application/json"}
-        payload = {
-            "image_url": data_uri,
-            "enable_pbr": True,
-            "should_remesh": True,
-            "should_texture": True,
-            "save_pre_remeshed_model": True,
-        }
-        resp = requests.post(url, headers=headers, json=payload, timeout=120)
-        resp.raise_for_status()
-        task_id = resp.json().get("result")
-        if not task_id:
-            raise RuntimeError(f"Meshy create task returned no id: {resp.text}")
-
-        with meshy_lock:
-            meshy_job["task_id"] = task_id
-            meshy_job["status"] = "PENDING"
-            meshy_job["progress"] = 0
-
-        get_url = f"https://api.meshy.ai/openapi/v1/image-to-3d/{task_id}"
-        while True:
-            # polling loop (2s is a decent balance)
-            r = requests.get(get_url, headers={"Authorization": f"Bearer {MESHY_API_KEY}"}, timeout=60)
-            r.raise_for_status()
-            obj = r.json()
-
-            status = obj.get("status", "")
-            progress = int(obj.get("progress", 0) or 0)
-
-            thumb = obj.get("thumbnail_url", "") or ""
-            model_urls = obj.get("model_urls", {}) or {}
-            glb_url = model_urls.get("glb", "") or ""
-
+        def update_progress(status, progress):
             with meshy_lock:
-                meshy_job["status"] = status
-                meshy_job["progress"] = progress
-                meshy_job["thumb_url"] = thumb
-                meshy_job["glb_url"] = glb_url
+                meshy_job.update(status=status, progress=progress)
 
-            if status == "SUCCEEDED":
-                if not glb_url:
-                    raise RuntimeError("Task succeeded but no GLB URL returned.")
-                out_glb = os.path.join(OUTPUT_DIR, f"meshy_{task_id}.glb")
-                _download_file(glb_url, out_glb)
-                with meshy_lock:
-                    meshy_job["glb_path"] = out_glb
-                    meshy_job["running"] = False
-                _open_file_or_url(out_glb, fallback_url=thumb)
-                return
-
-            if status in ("FAILED", "CANCELED", "CANCELLED"):
-                err = obj.get("task_error", {}) or {}
-                msg = err.get("message", "") or "Unknown Meshy error"
-                raise RuntimeError(f"{status}: {msg}")
-
-            time.sleep(2.0)
-
-    except Exception as e:
+        model_url = client.wait_for_task(task_id, on_progress=update_progress)
+        # Remote identifiers never become local filenames.
+        model_path = _timestamp_name("meshy", "glb")
+        _download_file(model_url, model_path)
+        with meshy_lock:
+            meshy_job.update(glb_path=model_path, progress=100, status="SUCCEEDED")
+        _open_file_or_url(model_path)
+    except MeshyError as error:
+        with meshy_lock:
+            meshy_job["error"] = str(error)
+    except Exception:
+        with meshy_lock:
+            meshy_job["error"] = "3D processing failed. Check the output folder and provider dashboard before retrying."
+    finally:
         with meshy_lock:
             meshy_job["running"] = False
-            meshy_job["error"] = str(e)
+
 
 def start_meshy_3d_from_canvas(canvas_bgr: np.ndarray):
-    # avoid starting multiple jobs at once
+    # Reserve the job before saving/starting the thread, preventing duplicate submissions.
     with meshy_lock:
         if meshy_job["running"]:
-            return
+            return False
+        if not MESHY_ENABLED or not MESHY_API_KEY:
+            meshy_job["error"] = "3D is disabled. Set MESHY_ENABLED=true and MESHY_API_KEY to opt in."
+            return False
+        meshy_job.update(running=True, task_id=None, progress=0, status="STARTING",
+                         error="", glb_url="", thumb_url="", glb_path="")
+    try:
+        png_path, svg_path = save_png_and_svg(canvas_bgr)
+        print(f"Saved: {png_path}")
+        print(f"Vector: {svg_path}")
+        print("Sending drawing canvas to Meshy...")
+        thread = threading.Thread(target=_meshy_worker, args=(png_path,), daemon=True)
+        thread.start()
+        return True
+    except Exception:
+        with meshy_lock:
+            meshy_job.update(running=False, error="Could not prepare the drawing for 3D generation.")
+        return False
 
-    png_path, svg_path = save_png_and_svg(canvas_bgr)
-    print(f"Saved: {png_path}")
-    print(f"Vector: {svg_path}")
-    print("Sending to Meshy...")
 
-    t = threading.Thread(target=_meshy_worker, args=(png_path,), daemon=True)
-    t.start()
+def clear_canvas():
+    global _current_stroke, selected_stroke_idx
+    strokes.clear()
+    _current_stroke = None
+    selected_stroke_idx = None
+    if eraser_mask is not None:
+        eraser_mask[:] = 0
+
 
 # =========================
 # MAIN LOOP
@@ -838,182 +828,173 @@ def main():
     global brush_thickness, eraser_thickness, select_mode, selected_stroke_idx
     global straighten_enabled, ui_click_armed
 
+    if not MODEL_PATH.is_file():
+        raise FileNotFoundError("Run python tools/download_model.py before starting the webcam app.")
     _update_straight_button()
 
     cap = cv2.VideoCapture(0)
-    # camera resolution (not guaranteed, but helps on most webcams)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    try:
+        # camera resolution (not guaranteed, but helps on most webcams)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-    ret, frame = cap.read()
-    if not ret:
-        print("Failed to access camera.")
-        return
-    frame = cv2.flip(frame, 1)  # mirror view feels more natural for drawing
-    h, w, _ = frame.shape
-    eraser_mask = np.zeros((h, w), dtype=np.uint8)
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to access camera.")
+            return
+        frame = cv2.flip(frame, 1)  # mirror view feels more natural for drawing
+        h, w, _ = frame.shape
+        eraser_mask = np.zeros((h, w), dtype=np.uint8)
 
-    with mp_hands.Hands(
-        model_complexity=0,
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.7,
-        max_num_hands=1,
-    ) as hands:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
+        with HandTracker(MODEL_PATH) as hands:
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-            frame = cv2.flip(frame, 1)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = hands.process(rgb)
+                frame = cv2.flip(frame, 1)
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = hands.process(rgb)
 
-            if click_cooldown > 0:
-                click_cooldown -= 1
+                if click_cooldown > 0:
+                    click_cooldown -= 1
 
-            if eraser_mask is None or eraser_mask.shape[:2] != frame.shape[:2]:
-                eraser_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+                if eraser_mask is None or eraser_mask.shape[:2] != frame.shape[:2]:
+                    eraser_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
 
-            # render canvas BEFORE checking UI clicks (needed for 3D button)
-            canvas_now = render_canvas(frame.shape)
+                # render canvas BEFORE checking UI clicks (needed for 3D button)
+                canvas_now = render_canvas(frame.shape)
 
-            if results.multi_hand_landmarks:
-                for hand_landmarks in results.multi_hand_landmarks:
-                    mp_drawing.draw_landmarks(
-                        frame,
-                        hand_landmarks,
-                        mp_hands.HAND_CONNECTIONS,
-                        mp_drawing_styles.get_default_hand_landmarks_style(),
-                        mp_drawing_styles.get_default_hand_connections_style(),
-                    )
+                if results.multi_hand_landmarks:
+                    for hand_landmarks in results.multi_hand_landmarks:
+                        draw_tracked_hand(frame, hand_landmarks)
 
-                    x, y = get_index_tip(hand_landmarks, frame.shape)
-                    gesture = get_gesture(hand_landmarks, frame.shape)
+                        x, y = get_index_tip(hand_landmarks, frame.shape)
+                        gesture = get_gesture(hand_landmarks, frame.shape)
 
-                    # ---------- UI pinch click (thumb+middle), edge-triggered ----------
-                    clicked_now = ui_pinch_click(hand_landmarks, frame.shape)
-                    ui_clicked_event = False
-                    if ui_click_armed and clicked_now:
-                        ui_clicked_event = True
-                        ui_click_armed = False
-                    elif not clicked_now:
-                        ui_click_armed = True
+                        # ---------- UI pinch click (thumb+middle), edge-triggered ----------
+                        clicked_now = ui_pinch_click(hand_landmarks, frame.shape)
+                        ui_clicked_event = False
+                        if ui_click_armed and clicked_now:
+                            ui_clicked_event = True
+                            ui_click_armed = False
+                        elif not clicked_now:
+                            ui_click_armed = True
 
-                    # visual feedback when click is held
-                    if clicked_now:
-                        cv2.circle(frame, (x, y), 6, (0, 255, 255), -1, cv2.LINE_AA)
+                        # visual feedback when click is held
+                        if clicked_now:
+                            cv2.circle(frame, (x, y), 6, (0, 255, 255), -1, cv2.LINE_AA)
 
-                    if gesture == "paint":
-                        _prev_erase_pt = None
-
-                        # UI interaction only triggers on click event
-                        ui_action = check_ui_interaction(x, y, ui_clicked_event, canvas_now)
-                        if ui_action:
-                            finish_stroke()
-                            selected_stroke_idx = None
-                            if click_cooldown == 0:
-                                click_cooldown = CLICK_DELAY
-                            continue
-
-                        if select_mode:
-                            finish_stroke()
-                            if click_cooldown == 0:
-                                idx = select_nearest_stroke((x, y))
-                                selected_stroke_idx = idx
-                                click_cooldown = CLICK_DELAY
-                            cv2.circle(frame, (x, y), 10, (255, 255, 0), 2, cv2.LINE_AA)
-                        else:
-                            pt = (x, y)
-                            cv2.circle(frame, pt, max(1, brush_thickness // 2), draw_color, -1, cv2.LINE_AA)
-
-                            if _current_stroke is None:
-                                start_stroke(pt)
-                                unerase_on_draw(None, pt, brush_thickness)
-                            else:
-                                prev = _current_stroke["points"][-1] if _current_stroke["points"] else None
-                                append_stroke_point(pt)
-                                unerase_on_draw(prev, pt, brush_thickness)
-
-                    elif gesture == "erase":
-                        # stop drawing when erasing (keeps strokes clean)
-                        finish_stroke()
-                        selected_stroke_idx = None
-
-                        close, center = fingers_close(hand_landmarks, frame.shape, PINCH_THRESH_PX)
-                        if close:
-                            ex, ey = center
-                            r = max(ERASER_MIN, min(eraser_thickness, ERASER_MAX)) // 2
-                            if _prev_erase_pt is None:
-                                cv2.circle(eraser_mask, (ex, ey), r, 255, -1, cv2.LINE_AA)
-                            else:
-                                cv2.line(eraser_mask, _prev_erase_pt, (ex, ey), 255, thickness=r * 2, lineType=cv2.LINE_AA)
-                            _prev_erase_pt = (ex, ey)
-                            draw_eraser_indicator(frame, (ex, ey), r)
-                        else:
+                        if gesture == "paint":
                             _prev_erase_pt = None
 
-                    else:
-                        finish_stroke()
-                        _prev_erase_pt = None
-            else:
-                finish_stroke()
-                _prev_erase_pt = None
+                            # UI interaction only triggers on click event
+                            ui_action = check_ui_interaction(x, y, ui_clicked_event, canvas_now)
+                            if ui_action:
+                                finish_stroke()
+                                selected_stroke_idx = None
+                                if click_cooldown == 0:
+                                    click_cooldown = CLICK_DELAY
+                                continue
 
-            # Re-render after any updates
-            canvas = render_canvas(frame.shape)
+                            if select_mode:
+                                finish_stroke()
+                                if click_cooldown == 0:
+                                    idx = select_nearest_stroke((x, y))
+                                    selected_stroke_idx = idx
+                                    click_cooldown = CLICK_DELAY
+                                cv2.circle(frame, (x, y), 10, (255, 255, 0), 2, cv2.LINE_AA)
+                            else:
+                                pt = (x, y)
+                                cv2.circle(frame, pt, max(1, brush_thickness // 2), draw_color, -1, cv2.LINE_AA)
 
-            combined = cv2.addWeighted(frame, 0.70, canvas, 0.30, 0)
-            draw_ui(combined)
+                                if _current_stroke is None:
+                                    start_stroke(pt)
+                                    unerase_on_draw(None, pt, brush_thickness)
+                                else:
+                                    prev = _current_stroke["points"][-1] if _current_stroke["points"] else None
+                                    append_stroke_point(pt)
+                                    unerase_on_draw(prev, pt, brush_thickness)
 
-            if selected_stroke_idx is not None:
-                cv2.putText(combined, f"Selected stroke: {selected_stroke_idx} (press x to delete)",
-                            (540, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+                        elif gesture == "erase":
+                            # stop drawing when erasing (keeps strokes clean)
+                            finish_stroke()
+                            selected_stroke_idx = None
 
-            cv2.imshow(WINDOW_NAME, combined)
-            key = cv2.waitKey(1) & 0xFF
+                            close, center = fingers_close(hand_landmarks, frame.shape, PINCH_THRESH_PX)
+                            if close:
+                                ex, ey = center
+                                r = max(ERASER_MIN, min(eraser_thickness, ERASER_MAX)) // 2
+                                if _prev_erase_pt is None:
+                                    cv2.circle(eraser_mask, (ex, ey), r, 255, -1, cv2.LINE_AA)
+                                else:
+                                    cv2.line(eraser_mask, _prev_erase_pt, (ex, ey), 255, thickness=r * 2, lineType=cv2.LINE_AA)
+                                _prev_erase_pt = (ex, ey)
+                                draw_eraser_indicator(frame, (ex, ey), r)
+                            else:
+                                _prev_erase_pt = None
 
-            # keyboard shortcuts (mostly for debugging / quick control)
-            if key == ord("q"):
-                break
-            elif key == ord("m"):
-                select_mode = not select_mode
-                finish_stroke()
-                click_cooldown = CLICK_DELAY
-            elif key == ord("x"):
-                delete_selected_stroke()
-                click_cooldown = CLICK_DELAY
-            elif key == ord("s"):
-                p = save_png(canvas)
-                print(f"Saved: {p}")
-            elif key == ord("v"):
-                svg = save_svg_only(canvas)
-                print(f"Vector (SVG only): {svg}")
-            elif key == ord("3"):
-                start_meshy_3d_from_canvas(canvas)
-            elif key == ord("t"):
-                straighten_enabled = not straighten_enabled
-                _update_straight_button()
-                print(f"Straighten: {'ON' if straighten_enabled else 'OFF'}")
-            elif key == ord("-"):
-                brush_thickness = max(BRUSH_MIN, brush_thickness - 1)
-            elif key == ord("="):
-                brush_thickness = min(BRUSH_MAX, brush_thickness + 1)
-            elif key == ord("["):
-                eraser_thickness = max(ERASER_MIN, eraser_thickness - 5)
-            elif key == ord("]"):
-                eraser_thickness = min(ERASER_MAX, eraser_thickness + 5)
-            elif key == ord("c"):
-                strokes.clear()
-                selected_stroke_idx = None
-                eraser_mask[:] = 0
-                click_cooldown = CLICK_DELAY
-            elif key == ord("r"):
-                # quick reset for the mask only (useful if erase got messy)
-                eraser_mask[:] = 0
-                click_cooldown = CLICK_DELAY
+                        else:
+                            finish_stroke()
+                            _prev_erase_pt = None
+                else:
+                    finish_stroke()
+                    _prev_erase_pt = None
 
-    cap.release()
-    cv2.destroyAllWindows()
+                # Re-render after any updates
+                canvas = render_canvas(frame.shape)
+
+                combined = cv2.addWeighted(frame, 0.70, canvas, 0.30, 0)
+                draw_ui(combined)
+
+                if selected_stroke_idx is not None:
+                    cv2.putText(combined, f"Selected stroke: {selected_stroke_idx} (press x to delete)",
+                                (540, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+                cv2.imshow(WINDOW_NAME, combined)
+                key = cv2.waitKey(1) & 0xFF
+
+                # keyboard shortcuts (mostly for debugging / quick control)
+                if key == ord("q"):
+                    break
+                elif key == ord("m"):
+                    select_mode = not select_mode
+                    finish_stroke()
+                    click_cooldown = CLICK_DELAY
+                elif key == ord("x"):
+                    delete_selected_stroke()
+                    click_cooldown = CLICK_DELAY
+                elif key == ord("s"):
+                    p = save_png(canvas)
+                    print(f"Saved: {p}")
+                elif key == ord("v"):
+                    svg = save_svg_only(canvas)
+                    print(f"Vector (SVG only): {svg}")
+                elif key == ord("3"):
+                    start_meshy_3d_from_canvas(canvas)
+                elif key == ord("t"):
+                    straighten_enabled = not straighten_enabled
+                    _update_straight_button()
+                    print(f"Straighten: {'ON' if straighten_enabled else 'OFF'}")
+                elif key == ord("-"):
+                    brush_thickness = max(BRUSH_MIN, brush_thickness - 1)
+                elif key == ord("="):
+                    brush_thickness = min(BRUSH_MAX, brush_thickness + 1)
+                elif key == ord("["):
+                    eraser_thickness = max(ERASER_MIN, eraser_thickness - 5)
+                elif key == ord("]"):
+                    eraser_thickness = min(ERASER_MAX, eraser_thickness + 5)
+                elif key == ord("c"):
+                    clear_canvas()
+                    click_cooldown = CLICK_DELAY
+                elif key == ord("r"):
+                    # quick reset for the mask only (useful if erase got messy)
+                    eraser_mask[:] = 0
+                    click_cooldown = CLICK_DELAY
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
